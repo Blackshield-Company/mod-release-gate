@@ -201,25 +201,32 @@ def parse_plugin(data, path='plugin'):
     if info.hedr_version is None:
         raise PluginError('TES4 header has no HEDR subrecord')
 
-    # Records and GRUPs are contiguous, so a flat walk visits every record header.
+    # Records and GRUPs are contiguous, so a flat walk visits every record header. A stack of open
+    # GRUPs keeps every record and nested group inside the boundary its enclosing group declares.
     pos, total = 24 + size, len(data)
     own_index = len(info.masters)
+    groups = []  # (start, end) of each enclosing GRUP, innermost last
     while pos < total:
-        if pos + 24 > total:
-            raise PluginError('truncated record header at offset %d' % pos)
+        while groups and pos == groups[-1][1]:
+            groups.pop()
+        limit = groups[-1][1] if groups else total
+        where = 'the GRUP at offset %d' % groups[-1][0] if groups else 'the file'
+        if pos + 24 > limit:
+            raise PluginError('truncated record header at offset %d crosses the end of %s' % (pos, where))
         rtype = data[pos:pos + 4]
         (rsize,) = struct.unpack_from('<I', data, pos + 4)
         if rtype == b'GRUP':
-            if rsize < 24 or pos + rsize > total:
-                raise PluginError('bad GRUP size %d at offset %d' % (rsize, pos))
+            if rsize < 24 or pos + rsize > limit:
+                raise PluginError('bad GRUP size %d at offset %d (overruns %s)' % (rsize, pos, where))
             info.groups += 1
+            groups.append((pos, pos + rsize))
             pos += 24
             continue
         if not all(65 <= c <= 90 or 48 <= c <= 57 or c == 95 for c in rtype):
             raise PluginError('invalid record type at offset %d' % pos)
         (fid,) = struct.unpack_from('<I', data, pos + 12)
-        if pos + 24 + rsize > total:
-            raise PluginError('%s record %08X overruns the file' % (rtype.decode('ascii'), fid))
+        if pos + 24 + rsize > limit:
+            raise PluginError('%s record %08X overruns %s' % (rtype.decode('ascii'), fid, where))
         info.records += 1
         index = fid >> 24
         if index == own_index:
@@ -544,8 +551,51 @@ def _strip_ns(root):
     return root
 
 
+def _inside(path, base):
+    """True if path, with every symlink resolved, stays within base (also resolved)."""
+    try:
+        Path(path).resolve().relative_to(Path(base).resolve())
+        return True
+    except (ValueError, OSError, RuntimeError):
+        return False
+
+
+def _escaping_links(folder, base):
+    """Entries under folder that are symlinks resolving outside base.
+
+    Directory symlinks that stay inside base are followed too (with cycle detection on the
+    resolved path), so a chain of internal aliases cannot hide an external link."""
+    found, seen, stack = [], set(), [Path(folder)]
+    while stack:
+        current = stack.pop()
+        try:
+            key = current.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            entries = list(current.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.is_symlink():
+                if not _inside(entry, base):
+                    found.append(entry)
+                    continue
+                if entry.is_dir():
+                    stack.append(entry)
+            elif entry.is_dir():
+                stack.append(entry)
+    return found
+
+
 def _exists_ci(base, relpath):
-    """Case-insensitive lookup the way mod managers on Windows resolve FOMOD sources."""
+    """Case-insensitive lookup the way mod managers on Windows resolve FOMOD sources.
+
+    Symlinks are followed, so callers must check the hit with _inside() before trusting it.
+    """
     current = Path(base)
     for part in PurePosixPath(relpath).parts:
         if not current.is_dir():
@@ -605,7 +655,12 @@ def check_fomod(root, given):
 
     refs = []
     for node in tree.iter():
-        if node.tag in ('file', 'folder') and node.get('source') is not None:
+        if node.tag in ('file', 'folder'):
+            if not (node.get('source') or '').strip():
+                subject = '<%s destination="%s">' % (node.tag, node.get('destination') or '')
+                results.append(finding('fomod', 'error', 'FOMOD-NO-SOURCE', subject,
+                                       '<%s> has no source attribute' % node.tag))
+                continue
             refs.append((node.tag, node.get('source')))
         elif node.tag in ('moduleImage', 'image') and node.get('path'):
             refs.append(('image', node.get('path')))
@@ -619,6 +674,16 @@ def check_fomod(root, given):
             continue
         checked += 1
         hit = _exists_ci(package, cleaned)
+        if hit is not None and not _inside(hit, package):
+            results.append(finding('fomod', 'error', 'FOMOD-SYMLINK-ESCAPE', cleaned,
+                                   '%s resolves outside the package via a symlink' % kind))
+            continue
+        escaping = _escaping_links(hit, package) if hit is not None and kind == 'folder' and hit.is_dir() else []
+        if escaping:
+            results.append(finding('fomod', 'error', 'FOMOD-SYMLINK-ESCAPE', cleaned,
+                                   'folder contains %d symlink(s) resolving outside the package, first %s'
+                                   % (len(escaping), (PurePosixPath(cleaned) / escaping[0].relative_to(hit).as_posix()))))
+            continue
         if hit is None or (kind == 'folder' and not hit.is_dir()) or (kind != 'folder' and not hit.is_file()):
             missing += 1
             results.append(finding('fomod', 'error', 'FOMOD-MISSING-SOURCE', cleaned,

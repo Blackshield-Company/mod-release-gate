@@ -1,0 +1,44 @@
+# Copy to .github/workflows/release-gate.yml in a Skyrim SE or Fallout 4 mod repository.
+name: release-gate
+
+on:
+  pull_request:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # lets the gate find a tag at HEAD on non-tag events
+
+      - id: gate
+        # Pin to a commit SHA or tag of your copy of mod-release-gate.
+        uses: synthalorian/mod-release-gate@v1
+        with:
+          game: skyrimse              # or fallout4
+          plugins: |
+            MyMod.esp
+          esl: require                # any | require | forbid
+          tag-prefix: v
+          require-tag: ${{ github.ref_type == 'tag' }}
+          changelog: CHANGELOG.md
+          fomod: fomod
+          allow: |
+            Source/Scripts/*.psc
+          forbid: |
+            *.log
+            *.tmp
+          conflicts-fail-on: collision
+          fail-on: error
+
+      - name: Use the result
+        if: always()
+        env:
+          RESULT: ${{ steps.gate.outputs.result }}
+        run: echo "release gate: $RESULT"
