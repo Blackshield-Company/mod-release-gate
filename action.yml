@@ -1,0 +1,174 @@
+name: 'mod-release-gate'
+description: 'Pre-release gate for Skyrim SE and Fallout 4 mods: ESL flags, version/tag/changelog, stray files, FOMOD XML, conflicts.'
+author: 'synthalorian'
+branding:
+  icon: 'shield'
+  color: 'gray-dark'
+
+inputs:
+  game:
+    description: 'Target game: skyrimse or fallout4.'
+    required: true
+  path:
+    description: 'Mod directory to check (normally the checkout root).'
+    required: false
+    default: '.'
+  plugins:
+    description: 'Plugin paths or globs relative to path, one per line or comma separated. Empty: discover every .esp/.esm/.esl.'
+    required: false
+    default: ''
+  esl:
+    description: 'ESL policy for every checked plugin: any, require, or forbid. Light plugins are always range-checked.'
+    required: false
+    default: 'any'
+  tag:
+    description: 'Release tag. Empty: the pushed tag on tag events, else a tag at HEAD.'
+    required: false
+    default: ''
+  tag-prefix:
+    description: 'Prefix stripped from the tag before comparing versions.'
+    required: false
+    default: 'v'
+  require-tag:
+    description: 'true to fail when no release tag can be determined.'
+    required: false
+    default: 'false'
+  changelog:
+    description: 'Changelog path relative to path. Empty: CHANGELOG.md, CHANGELOG, CHANGES.md or docs/CHANGELOG.md.'
+    required: false
+    default: ''
+  fomod:
+    description: 'FOMOD directory relative to path. Empty: the first fomod/ModuleConfig.xml found.'
+    required: false
+    default: ''
+  scan:
+    description: 'Directories or zips (relative to path) to scan for forbidden files, one per line. Empty: path.'
+    required: false
+    default: ''
+  allow:
+    description: 'Allowlist globs for the forbidden-files check, one per line (e.g. Source/Scripts/*.psc).'
+    required: false
+    default: ''
+  forbid:
+    description: 'Extra forbidden globs, one per line.'
+    required: false
+    default: ''
+  against:
+    description: 'Other local mod directories for the conflict report, one per line.'
+    required: false
+    default: ''
+  conflicts-fail-on:
+    description: 'mod-conflict-graph severity that counts as an error: collision, probable, warning, or never.'
+    required: false
+    default: 'collision'
+  require-conflicts:
+    description: 'true to fail when mod-conflict-graph cannot be loaded (default: skip with a notice).'
+    required: false
+    default: 'false'
+  mod-conflict-graph-path:
+    description: 'Path to a local mod-conflict-graph checkout. Empty: install from mod-conflict-graph-source.'
+    required: false
+    default: ''
+  mod-conflict-graph-source:
+    description: 'Git URL used when no local checkout is given. Set to an empty string to never download it.'
+    required: false
+    default: 'https://github.com/Blackshield-Company/mod-conflict-graph'
+  skip:
+    description: 'Checks to skip, comma separated: plugins, version, files, fomod, conflicts.'
+    required: false
+    default: ''
+  advisory:
+    description: 'Checks whose errors are reported as warnings, comma separated.'
+    required: false
+    default: ''
+  fail-on:
+    description: 'Lowest level that fails the gate: error, warning, or never.'
+    required: false
+    default: 'error'
+  python:
+    description: 'Python 3.8+ interpreter.'
+    required: false
+    default: 'python3'
+
+outputs:
+  result:
+    description: 'pass or fail.'
+    value: ${{ steps.gate.outputs.result }}
+  errors:
+    description: 'Number of error findings.'
+    value: ${{ steps.gate.outputs.errors }}
+  warnings:
+    description: 'Number of warning findings.'
+    value: ${{ steps.gate.outputs.warnings }}
+  report:
+    description: 'Path to the Markdown report.'
+    value: ${{ steps.gate.outputs.report }}
+  json:
+    description: 'Path to the JSON result.'
+    value: ${{ steps.gate.outputs.json }}
+
+runs:
+  using: 'composite'
+  steps:
+    - id: mcg
+      name: Locate mod-conflict-graph
+      shell: bash
+      env:
+        GATE_PYTHON: ${{ inputs.python }}
+        GATE_SKIP: ${{ inputs.skip }}
+        MCG_PATH: ${{ inputs.mod-conflict-graph-path }}
+        MCG_SOURCE: ${{ inputs.mod-conflict-graph-source }}
+      # Never fails: when nothing works the gate skips the conflict check with a notice.
+      run: |
+        set -uo pipefail
+        "$GITHUB_ACTION_PATH/scripts/locate-mcg.sh" >> "$GITHUB_OUTPUT" || echo "path=" >> "$GITHUB_OUTPUT"
+
+    - id: gate
+      name: Run mod-release-gate
+      shell: bash
+      env:
+        GATE_PYTHON: ${{ inputs.python }}
+        GATE_ROOT: ${{ inputs.path }}
+        GATE_GAME: ${{ inputs.game }}
+        GATE_PLUGINS: ${{ inputs.plugins }}
+        GATE_ESL: ${{ inputs.esl }}
+        GATE_TAG: ${{ inputs.tag }}
+        GATE_TAG_PREFIX: ${{ inputs.tag-prefix }}
+        GATE_REQUIRE_TAG: ${{ inputs.require-tag }}
+        GATE_CHANGELOG: ${{ inputs.changelog }}
+        GATE_FOMOD: ${{ inputs.fomod }}
+        GATE_SCAN: ${{ inputs.scan }}
+        GATE_ALLOW: ${{ inputs.allow }}
+        GATE_FORBID: ${{ inputs.forbid }}
+        GATE_AGAINST: ${{ inputs.against }}
+        GATE_CONFLICTS_FAIL_ON: ${{ inputs.conflicts-fail-on }}
+        GATE_REQUIRE_CONFLICTS: ${{ inputs.require-conflicts }}
+        GATE_SKIP: ${{ inputs.skip }}
+        GATE_ADVISORY: ${{ inputs.advisory }}
+        GATE_FAIL_ON: ${{ inputs.fail-on }}
+        MOD_CONFLICT_GRAPH_PATH: ${{ steps.mcg.outputs.path }}
+        GITHUB_REF_TYPE: ${{ github.ref_type }}
+        GITHUB_REF_NAME: ${{ github.ref_name }}
+      # Inputs reach the script only through the environment, never by template expansion.
+      run: |
+        set -euo pipefail
+        out_dir="${RUNNER_TEMP:-/tmp}/mod-release-gate"
+        mkdir -p "$out_dir"
+        args=(--root "$GATE_ROOT" --game "$GATE_GAME" --esl "$GATE_ESL" --tag "$GATE_TAG"
+              --tag-prefix "$GATE_TAG_PREFIX" --changelog "$GATE_CHANGELOG" --fomod "$GATE_FOMOD"
+              --conflicts-fail-on "$GATE_CONFLICTS_FAIL_ON" --fail-on "$GATE_FAIL_ON"
+              --plugins "$GATE_PLUGINS" --scan "$GATE_SCAN" --allow "$GATE_ALLOW" --forbid "$GATE_FORBID"
+              --against "$GATE_AGAINST" --skip "$GATE_SKIP" --advisory "$GATE_ADVISORY"
+              --report "$out_dir/report.md" --json "$out_dir/result.json"
+              --github-output "$GITHUB_OUTPUT" --quiet)
+        [ "$GATE_REQUIRE_TAG" = "true" ] && args+=(--require-tag)
+        [ "$GATE_REQUIRE_CONFLICTS" = "true" ] && args+=(--require-conflicts)
+        [ -n "${GITHUB_STEP_SUMMARY:-}" ] && args+=(--summary "$GITHUB_STEP_SUMMARY")
+        echo "report=$out_dir/report.md" >> "$GITHUB_OUTPUT"
+        echo "json=$out_dir/result.json" >> "$GITHUB_OUTPUT"
+        set +e
+        "$GATE_PYTHON" "$GITHUB_ACTION_PATH/scripts/mod_release_gate.py" "${args[@]}"
+        code=$?
+        set -e
+        [ -f "$out_dir/report.md" ] && cat "$out_dir/report.md"
+        exit "$code"
