@@ -488,13 +488,13 @@ class ConflictsCheck(unittest.TestCase):
         self.assertIn('CONFLICTS-ERROR', codes(result, 'warning'))
 
 
-@unittest.skipUnless(os.environ.get('MOD_CONFLICT_GRAPH_PATH') or Path('/workspace/mod-conflict-graph/modconflict').is_dir(),
+@unittest.skipUnless(os.environ.get('MOD_CONFLICT_GRAPH_PATH'),
                      'set MOD_CONFLICT_GRAPH_PATH to a mod-conflict-graph checkout to run')
 class RealModConflictGraph(unittest.TestCase):
     """Integration with a real mod-conflict-graph checkout (run in a subprocess for isolation)."""
 
     def test_record_override_collision(self):
-        mcg = os.environ.get('MOD_CONFLICT_GRAPH_PATH') or '/workspace/mod-conflict-graph'
+        mcg = os.environ['MOD_CONFLICT_GRAPH_PATH']
         with tempfile.TemporaryDirectory() as tmp:
             a, b = Path(tmp, 'Alpha'), Path(tmp, 'Beta')
             make_mod(a, plugin='Alpha.esp', fomod=False)
