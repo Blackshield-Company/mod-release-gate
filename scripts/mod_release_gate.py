@@ -561,13 +561,33 @@ def _inside(path, base):
 
 
 def _escaping_links(folder, base):
-    """Entries under folder that are symlinks resolving outside base."""
-    found = []
-    for dirpath, dirnames, filenames in os.walk(folder):
-        for name in dirnames + filenames:
-            entry = Path(dirpath) / name
-            if entry.is_symlink() and not _inside(entry, base):
-                found.append(entry)
+    """Entries under folder that are symlinks resolving outside base.
+
+    Directory symlinks that stay inside base are followed too (with cycle detection on the
+    resolved path), so a chain of internal aliases cannot hide an external link."""
+    found, seen, stack = [], set(), [Path(folder)]
+    while stack:
+        current = stack.pop()
+        try:
+            key = current.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            entries = list(current.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.is_symlink():
+                if not _inside(entry, base):
+                    found.append(entry)
+                    continue
+                if entry.is_dir():
+                    stack.append(entry)
+            elif entry.is_dir():
+                stack.append(entry)
     return found
 
 

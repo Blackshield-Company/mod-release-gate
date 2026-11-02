@@ -483,6 +483,21 @@ class FomodCheck(unittest.TestCase):
         self.assertEqual(len(escape), 1)
         self.assertIn('optional/textures/b.dds', escape[0]['detail'])
 
+    def test_nested_internal_dir_alias_hiding_external_link(self):
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        write(outside.name, 'c.dds', b'DDS ')
+        make_mod(self.root)
+        (self.root / 'hidden').mkdir()
+        (self.root / 'hidden/c.dds').symlink_to(Path(outside.name) / 'c.dds')
+        (self.root / 'optional/textures/alias').symlink_to(self.root / 'hidden')
+        # an internal alias cycle must not hang the walk
+        (self.root / 'hidden/loop').symlink_to(self.root / 'optional')
+        code, result = self.fomod()
+        self.assertEqual(code, 1)
+        self.assertIn('FOMOD-SYMLINK-ESCAPE', codes(result, 'error'))
+        self.assertNotIn('FOMOD-OK', codes(result, 'notice'))
+
     def test_symlink_inside_package_is_allowed(self):
         make_mod(self.root)
         (self.root / 'assets').mkdir()
