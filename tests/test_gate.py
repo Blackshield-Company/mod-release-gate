@@ -3,6 +3,7 @@ import io
 import json
 import os
 from pathlib import Path
+import struct
 import subprocess
 import sys
 import tempfile
@@ -16,7 +17,7 @@ sys.path.insert(0, str(REPO / 'scripts'))
 sys.path.insert(0, str(HERE))
 
 import mod_release_gate as gate  # noqa: E402
-from fixtures import FLAG_ESL, FLAG_ESM, make_mod, plugin_bytes, write  # noqa: E402
+from fixtures import FLAG_ESL, FLAG_ESM, grup, make_mod, plugin_bytes, record, subrecord, write  # noqa: E402
 
 SCRIPT = REPO / 'scripts' / 'mod_release_gate.py'
 CLEAN_ENV = {k: v for k, v in os.environ.items()
@@ -66,6 +67,38 @@ class PluginParsing(unittest.TestCase):
         data = plugin_bytes(new_ids=[0x800, 0x801])
         with self.assertRaises(gate.PluginError):
             gate.parse_plugin(data[:-5], 'cut.esp')
+
+    def test_group_size_must_contain_its_records(self):
+        data = bytearray(plugin_bytes(new_ids=[0x800, 0x801]))
+        start = data.index(b'GRUP')
+        struct.pack_into('<I', data, start + 4, 25)
+        with self.assertRaisesRegex(gate.PluginError, 'GRUP at offset %d' % start):
+            gate.parse_plugin(bytes(data), 'shortgroup.esp')
+
+    def test_group_boundary_between_records(self):
+        # The group declares room for exactly one record; the second sits outside any group.
+        one = record(b'MISC', 0x800, subrecord(b'EDID', b'A\0'))
+        data = bytearray(plugin_bytes(new_ids=[0x800]))
+        start = data.index(b'GRUP')
+        data = bytes(data[:start]) + grup(b'MISC', one) + one
+        info = gate.parse_plugin(data, 'loose.esp')
+        self.assertEqual((info.records, info.groups), (2, 1))
+        # But a record straddling the declared end is rejected.
+        straddle = bytes(data[:start]) + b'GRUP' + struct.pack('<I', 24 + len(one) - 1) + grup(b'MISC', one + one)[8:]
+        with self.assertRaisesRegex(gate.PluginError, 'overruns the GRUP'):
+            gate.parse_plugin(straddle, 'straddle.esp')
+
+    def test_nested_group_must_fit_parent(self):
+        one = record(b'CELL', 0x800, subrecord(b'EDID', b'A\0'))
+        child = grup(b'\0\0\0\0', one, group_type=2)
+        header = plugin_bytes()
+        good = header + grup(b'CELL', child)
+        self.assertEqual(gate.parse_plugin(good, 'nested.esp').groups, 2)
+        parent = bytearray(grup(b'CELL', child))
+        struct.pack_into('<I', parent, 4, len(parent) - 4)   # parent now ends inside the child
+        with self.assertRaisesRegex(gate.PluginError, 'bad GRUP size .*overruns the GRUP at offset %d'
+                                    % len(header)):
+            gate.parse_plugin(header + bytes(parent) + b'\0' * 4, 'nested-bad.esp')
 
     def test_missing_hedr(self):
         data = b'TES4' + (0).to_bytes(4, 'little') * 5
@@ -393,6 +426,72 @@ class FomodCheck(unittest.TestCase):
             'source="TestMod.esp"', 'source="..\\..\\etc\\passwd"')
         write(self.root, 'fomod/ModuleConfig.xml', text)
         self.assertIn('FOMOD-BAD-PATH', codes(self.fomod()[1], 'error'))
+
+    def test_missing_source_attribute(self):
+        make_mod(self.root)
+        text = (self.root / 'fomod/ModuleConfig.xml').read_text().replace(
+            '<file source="TestMod.esp" destination="TestMod.esp"/>', '<file destination="Demo.esp"/>')
+        write(self.root, 'fomod/ModuleConfig.xml', text)
+        code, result = self.fomod()
+        self.assertEqual(code, 1)
+        self.assertIn('FOMOD-NO-SOURCE', codes(result, 'error'))
+        self.assertNotIn('FOMOD-OK', codes(result, 'notice'))
+        subject = [f['subject'] for f in result['findings'] if f['code'] == 'FOMOD-NO-SOURCE'][0]
+        self.assertIn('Demo.esp', subject)
+
+    def test_blank_folder_source(self):
+        make_mod(self.root)
+        text = (self.root / 'fomod/ModuleConfig.xml').read_text().replace(
+            'source="optional\\textures"', 'source="  "')
+        write(self.root, 'fomod/ModuleConfig.xml', text)
+        self.assertIn('FOMOD-NO-SOURCE', codes(self.fomod()[1], 'error'))
+
+    def test_symlink_outside_package(self):
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        write(outside.name, 'secret.esp', b'TES4')
+        make_mod(self.root)
+        (self.root / 'TestMod.esp').unlink()
+        (self.root / 'assets').mkdir()
+        (self.root / 'assets/file').symlink_to(Path(outside.name) / 'secret.esp')
+        text = (self.root / 'fomod/ModuleConfig.xml').read_text().replace(
+            'source="TestMod.esp"', 'source="assets/file"')
+        write(self.root, 'fomod/ModuleConfig.xml', text)
+        code, result = self.fomod()
+        self.assertEqual(code, 1)
+        self.assertIn('FOMOD-SYMLINK-ESCAPE', codes(result, 'error'))
+        self.assertNotIn('FOMOD-OK', codes(result, 'notice'))
+
+    def test_symlinked_directory_outside_package(self):
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        write(outside.name, 'textures/a.dds', b'DDS ')
+        make_mod(self.root)
+        import shutil
+        shutil.rmtree(self.root / 'optional/textures')
+        (self.root / 'optional/textures').symlink_to(Path(outside.name) / 'textures')
+        self.assertIn('FOMOD-SYMLINK-ESCAPE', codes(self.fomod()[1], 'error'))
+
+    def test_symlink_inside_folder_escapes(self):
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        write(outside.name, 'b.dds', b'DDS ')
+        make_mod(self.root)
+        (self.root / 'optional/textures/b.dds').symlink_to(Path(outside.name) / 'b.dds')
+        result = self.fomod()[1]
+        escape = [f for f in result['findings'] if f['code'] == 'FOMOD-SYMLINK-ESCAPE']
+        self.assertEqual(len(escape), 1)
+        self.assertIn('optional/textures/b.dds', escape[0]['detail'])
+
+    def test_symlink_inside_package_is_allowed(self):
+        make_mod(self.root)
+        (self.root / 'assets').mkdir()
+        (self.root / 'assets/plugin.esp').symlink_to(self.root / 'TestMod.esp')
+        text = (self.root / 'fomod/ModuleConfig.xml').read_text().replace(
+            'source="TestMod.esp"', 'source="assets/plugin.esp"')
+        write(self.root, 'fomod/ModuleConfig.xml', text)
+        code, result = self.fomod()
+        self.assertEqual(code, 0, result['findings'])
 
     def test_utf16_info_xml(self):
         make_mod(self.root)
